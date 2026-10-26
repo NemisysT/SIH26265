@@ -1,0 +1,53 @@
+# Render Blueprint (https://render.com/docs/blueprint-spec). Not applied automatically —
+# review plans/regions in the Render dashboard before creating resources.
+#   web service  : Next.js portal with a persistent disk for protected documents
+#   cron job     : hourly maturity / escalation monitor (independent of any browser)
+#   database     : managed PostgreSQL
+databases:
+  - name: sdp-db
+    databaseName: sdp
+    user: sdp
+
+services:
+  - type: web
+    name: sdp-portal
+    runtime: node
+    plan: starter # persistent disks require a paid instance type
+    buildCommand: npm ci && npm run build
+    preDeployCommand: npx prisma migrate deploy
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    disk:
+      name: documents
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        fromDatabase: { name: sdp-db, property: connectionString }
+      - key: STORAGE_DIR
+        value: /var/data/documents
+      - key: DEMO_MODE
+        value: "true" # set to "false" for anything other than a demonstration
+      - key: DEMO_PASSWORD
+        sync: false # entered in the dashboard; never committed
+      - key: EMAIL_MODE
+        value: simulated
+      - key: VERIFICATION_PROVIDER
+        value: demo
+
+  - type: cron
+    name: sdp-monitor
+    runtime: node
+    plan: starter
+    schedule: "17 * * * *" # hourly, UTC
+    buildCommand: npm ci && npx prisma generate
+    startCommand: npm run monitor
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        fromDatabase: { name: sdp-db, property: connectionString }
+      - key: EMAIL_MODE
+        value: simulated
