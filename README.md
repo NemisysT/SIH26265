@@ -130,17 +130,122 @@ The matrix is in `src/server/auth/permissions.ts`; record scoping in `src/server
 
 ## 5. Getting started
 
-### Prerequisites
-* Node.js ≥ 20.18 (developed on 22) and npm
-* PostgreSQL 16 (local install or `docker compose up db`)
+### Quick start — one command
 
-### Setup
+After the prerequisites below are installed, everything else is automated:
+
+**Windows (PowerShell)**
+
+```powershell
+.\run.ps1
+```
+
+**macOS / Linux**
+
+```bash
+chmod +x run.sh   # only needed once, if your checkout lost the executable bit
+./run.sh
+```
+
+The launcher works from any directory (e.g. `C:\code\SIH26265\run.ps1` or `~/src/SIH26265/run.sh`).
+It then:
+
+1. checks Node.js (≥ 20.18) and npm;
+2. **first run only:** creates `.env` from `.env.example` with local-development settings
+   (random database password, `DEMO_MODE=true`, demo password = the documented local default
+   `Demo@SDP2026`) — an existing `.env` is never overwritten;
+3. starts PostgreSQL 16 in Docker (`docker compose up -d db`) and waits for its health check —
+   or uses your existing PostgreSQL in *local* mode;
+4. runs `npm ci` only when `node_modules` is missing or `package-lock.json` changed, and
+   `prisma generate` only when the schema changed;
+5. applies pending migrations (`prisma migrate deploy` — never a reset);
+6. loads the demonstration data **only if the database is completely empty** (first run);
+7. runs one maturity/escalation monitor pass (idempotent);
+8. starts the portal (`next dev`), waits for `/api/health` to answer *as this application*,
+   opens your browser and prints the URL (default **http://localhost:3000**).
+
+Press **Ctrl+C** to stop the portal. The database container keeps running (it is cheap and makes the
+next start fast); stop it with `docker compose stop db` if you like.
+
+#### Prerequisites
+
+| Needed | Notes |
+|---|---|
+| **Node.js 20.18+** (LTS recommended) with npm | https://nodejs.org |
+| **Either** Docker Desktop / Docker Engine with Compose v2 | recommended; the launcher starts the database for you |
+| **or** an existing PostgreSQL 16 server | set `SDP_DB_MODE="local"` and `DATABASE_URL` in `.env` |
+| Internet access on the first run | to download npm packages and the `postgres:16` image |
+
+No administrator rights or sudo are needed. The launcher never installs Docker, PostgreSQL or Node.
+
+**Windows execution policy.** If PowerShell says *running scripts is disabled on this system*, either run
+`powershell -ExecutionPolicy Bypass -File .\run.ps1` for this one invocation, or allow local scripts
+for your user once with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` (your decision; the
+launcher does not change security settings).
+
+#### Database options
+
+* **Docker (default when Docker is running on first start).** Service `db` in `docker-compose.yml`:
+  `postgres:16`, published on **127.0.0.1:5433 only** (`SDP_DB_PORT`), credentials from `.env`
+  (`SDP_DB_USER` / `SDP_DB_PASSWORD` / `SDP_DB_NAME`), data in the named volume **`sdp26265_pgdata`**.
+* **Existing local PostgreSQL.** Put `SDP_DB_MODE="local"` and a working `DATABASE_URL` in `.env`
+  (the role needs `CREATEDB`, or create `sdp_dev` yourself). If Docker is not running on the first start,
+  the launcher writes a local-mode `.env` and prints the one `CREATE ROLE` command to run. You can also
+  supply settings on the very first run, e.g.
+  `SDP_DB_MODE=local DATABASE_URL="postgresql://me:pw@localhost:5432/sdp_dev" ./run.sh`.
+
+#### Data persistence
+
+* Records live in PostgreSQL (the Docker volume `sdp26265_pgdata`, or your local server).
+* Uploaded documents live in `STORAGE_DIR` (default `./storage/documents`, git-ignored).
+* Normal starts never reset, truncate or reseed anything, and stopping never removes the volume.
+  **Do not run `docker compose down -v`** unless you intend to delete the local database.
+
+#### Demo login
+
+With `DEMO_MODE=true` the sign-in page lists the sample accounts — click one to sign in (this uses the
+normal password login). The password is `DEMO_PASSWORD` in `.env` (local default `Demo@SDP2026`; change it
+in `.env` **before** the first start if you want a different one). The launcher refuses to run when
+`NODE_ENV=production`, so it never enables demo mode for production.
+
+#### Changing ports and settings
+
+Edit `.env` (it is never overwritten): `PORT` + `APP_URL` for the web port, `SDP_DB_PORT` for the Docker
+database port (update the port in `DATABASE_URL`/`TEST_DATABASE_URL` too), `SDP_HOST` (default
+`127.0.0.1`; set `0.0.0.0` only if other devices must reach the dev server — demo passwords are public),
+and `SDP_OPEN_BROWSER="false"` to skip opening the browser. Environment variables override `.env`.
+
+#### Optional launcher commands
+
+| Windows | macOS / Linux | Purpose |
+|---|---|---|
+| `.\run.ps1 check` | `./run.sh check` | Check prerequisites and configuration (changes nothing) |
+| `.\run.ps1 test` | `./run.sh test` | Unit + integration tests (uses the separate `TEST_DATABASE_URL`) |
+| `.\run.ps1 e2e` | `./run.sh e2e` | Playwright tests — **reseeds the configured database**; asks you to type `RESET` |
+| `.\run.ps1 monitor` | `./run.sh monitor` | One maturity / escalation monitor pass |
+| `.\run.ps1 reset-demo` | `./run.sh reset-demo` | **Delete** all records/documents and reload demo data; asks you to type `RESET`; refuses if non-demo accounts exist |
+
+#### Troubleshooting
+
+| Message | What to do |
+|---|---|
+| *Node.js was not found / is too old* | Install Node.js 20.18+ and open a new terminal. |
+| *Docker is … not running* | Start Docker Desktop, or use `SDP_DB_MODE="local"` with your own PostgreSQL. |
+| *Host port 5433 is in use* | Change `SDP_DB_PORT` and the port in `DATABASE_URL`/`TEST_DATABASE_URL` in `.env`. |
+| *PostgreSQL rejected the credentials* | Docker: the volume keeps the password it was created with — restore the original `SDP_DB_PASSWORD`/`DATABASE_URL`. Local: fix `DATABASE_URL` or create the role. |
+| *Cannot reach PostgreSQL* | Start your PostgreSQL server or check host/port in `DATABASE_URL`. |
+| *Port 3000 is already used by another program* | Stop that program or set `PORT`/`APP_URL` in `.env`. The launcher never kills processes it did not start. |
+| *The portal is already running* | Another launcher started it — use that browser tab, or stop it in its terminal. |
+| *Applying database migrations failed* | Read the Prisma error; migrations are never reset automatically. |
+| A previous first run was interrupted while loading demo data | `./run.sh reset-demo` (or `.\run.ps1 reset-demo`). |
+
+### Manual setup (without the launcher)
 
 ```bash
 cp .env.example .env            # then edit DATABASE_URL, DEMO_MODE=true, DEMO_PASSWORD
 npm ci                          # .npmrc sets legacy-peer-deps (works around an npm 10 resolver bug with Vitest 4)
 npx prisma migrate deploy       # apply migrations
-npm run db:seed                 # load deterministic demonstration data (wipes the database!)
+npm run db:seed -- --if-empty   # load demonstration data into an EMPTY database (never deletes anything)
 npm run dev                     # http://localhost:3000
 ```
 
@@ -149,12 +254,14 @@ Other commands:
 ```bash
 npm run monitor                 # one maturity/escalation/SLA pass (cron entry point)
 npm run monitor:watch           # loop every MONITOR_INTERVAL_MINUTES
+npm run db:seed                 # RESET demo data (wipes records and stored documents)
 npm run db:reset                # drop + migrate + seed
 npm run build && npm run start  # production build / server
 ```
 
-The seed refuses to run if non-demo accounts exist (use `-- --force` only in development). Dates are
-offsets from today in IST; set `SEED_REFERENCE_DATE=YYYY-MM-DD` for fully fixed dates.
+`npm run db:seed` without `--if-empty` resets the data and refuses to run if non-demo accounts exist
+(use `-- --force` only in development). Dates are offsets from today in IST; set
+`SEED_REFERENCE_DATE=YYYY-MM-DD` for fully fixed dates.
 
 ### Demonstration accounts
 
@@ -287,7 +394,7 @@ delivery retries/failure capping, idempotent creates.
   dashboard, set `DEMO_PASSWORD` (and `DEMO_MODE=false` for anything beyond a demo), then open a
   shell on the web service and run `npm run db:seed` if demonstration data is wanted. Persistent disks
   and pre-deploy commands need a paid instance type; confirm plan names in the dashboard.
-* **Docker** — `Dockerfile` (migrates on start) and `docker-compose.yml` (Postgres + app + monitor).
+* **Docker** — `Dockerfile` (migrates on start) and `docker-compose.yml` (`docker compose --profile full up --build` runs Postgres + app + monitor; plain `docker compose up -d db` starts only the database used by the launchers).
 * Production notes: terminate TLS in front of the app; keep `STORAGE_DIR` on durable, backed-up,
   access-restricted storage (or replace `storage/files.ts` with an object store); run a single
   instance or replace the in-memory rate limiter with a shared store; configure log retention.
@@ -306,4 +413,4 @@ delivery retries/failure capping, idempotent creates.
 * Dev-tool advisories: `npm audit` reports issues in the Prisma CLI's `deepmerge-ts` and
   Tailwind 3's `postcss-selector-parser` (build-time only, no runtime exposure); resolve by upgrading
   to Prisma 7 / Tailwind 4 when convenient.
-* Docker files were written but could not be built in the development sandbox (no Docker daemon).
+* Docker files and the launchers' Docker mode could not be executed in the development sandbox (no Docker daemon); `run.ps1` was executed with PowerShell 7 on Linux, not on Windows.

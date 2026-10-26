@@ -5,8 +5,11 @@
 // Dates are offsets from a reference date (default: today in IST; override with
 // SEED_REFERENCE_DATE=YYYY-MM-DD) so "expiring in 25 days" stays true whenever you seed.
 //
-//   npm run db:seed            # refuses to run if non-demo accounts exist
-//   npm run db:seed -- --force # wipe everything anyway (development only)
+//   npm run db:seed              # RESETS demo data; refuses if non-demo accounts exist
+//   npm run db:seed -- --force   # wipe everything anyway (development only)
+//   npm run db:seed -- --if-empty  # seed only a completely empty database; never deletes anything
+//                                  (used by run.sh / run.ps1 on first start)
+import "../scripts/load-env";
 import { promises as fs } from "node:fs";
 import { prisma } from "@/server/db";
 import { env } from "@/server/env";
@@ -28,6 +31,7 @@ import { runMonitor } from "@/server/jobs/monitor";
 import { DEFAULT_SETTINGS } from "@/server/settings";
 
 const FORCE = process.argv.includes("--force");
+const IF_EMPTY = process.argv.includes("--if-empty");
 const DEMO_PASSWORD = process.env.DEMO_PASSWORD ?? "Demo@SDP2026";
 const REF = parseDateOnly(process.env.SEED_REFERENCE_DATE) ?? businessToday(new Date());
 let minuteCounter = 0;
@@ -83,12 +87,30 @@ const INSTITUTIONS = [
 ] as const;
 type InstKey = (typeof INSTITUTIONS)[number]["key"];
 
+/** Rows in the core tables; zero everywhere means a freshly migrated database. */
+async function existingRows() {
+  const [users, institutions, instruments, documents, regions, auditEvents] = await Promise.all([
+    prisma.user.count(),
+    prisma.institution.count(),
+    prisma.instrument.count(),
+    prisma.document.count(),
+    prisma.region.count(),
+    prisma.auditEvent.count(),
+  ]);
+  return { users, institutions, instruments, documents, regions, auditEvents };
+}
+
 async function resetDatabase() {
+  if (env.isProduction && !env.demoMode) throw new Error("Refusing to seed demonstration data in production unless DEMO_MODE=true.");
+  if (IF_EMPTY) {
+    // Non-destructive path: no TRUNCATE and no removal of stored documents.
+    await fs.mkdir(env.storageDir, { recursive: true });
+    return;
+  }
   const nonDemoUsers = await prisma.user.count({ where: { isDemo: false } });
   if (nonDemoUsers > 0 && !FORCE) {
     throw new Error(`Refusing to seed: ${nonDemoUsers} non-demo user account(s) exist. Re-run with --force to wipe ALL data.`);
   }
-  if (env.isProduction && !env.demoMode) throw new Error("Refusing to seed demonstration data in production unless DEMO_MODE=true.");
   if (env.isProduction && !process.env.DEMO_PASSWORD) {
     throw new Error("Set DEMO_PASSWORD explicitly before seeding a production-mode deployment; the documented default is for local use only.");
   }
@@ -129,6 +151,19 @@ function draftInput(s: Spec) {
 }
 
 async function main() {
+  if (IF_EMPTY) {
+    const rows = await existingRows();
+    const total = Object.values(rows).reduce((a, b) => a + b, 0);
+    if (total > 0) {
+      console.log(`Existing data found (${rows.users} users, ${rows.institutions} institutions, ${rows.instruments} instruments); demonstration seed skipped.`);
+      const marker = await prisma.systemSetting.findUnique({ where: { key: "demo_seed" } });
+      const nonDemo = await prisma.user.count({ where: { isDemo: false } });
+      if (!marker && nonDemo === 0 && rows.users > 0 && rows.institutions > 0) {
+        console.warn("Note: no demo-seed completion marker was found. If a previous first-run seed was interrupted, reset the demo data with `./run.sh reset-demo` (or `.\\run.ps1 reset-demo`).");
+      }
+      return;
+    }
+  }
   console.log(`Seeding demonstration data (reference date ${toDateOnlyString(REF)})…`);
   await resetDatabase();
   setClock(at(-420));
@@ -518,6 +553,13 @@ async function main() {
   setClock(new Date(addDays(REF, 0).getTime() + 3 * 3600_000));
   const { summary } = await runMonitor({ trigger: "CLI" });
   setClock(null);
+
+  // Completion marker: lets `--if-empty` distinguish a finished demo seed from an interrupted one.
+  await prisma.systemSetting.upsert({
+    where: { key: "demo_seed" },
+    create: { key: "demo_seed", value: { completedAt: new Date().toISOString(), referenceDate: toDateOnlyString(REF) } },
+    update: { value: { completedAt: new Date().toISOString(), referenceDate: toDateOnlyString(REF) } },
+  });
 
   const counts = {
     institutions: await prisma.institution.count(),

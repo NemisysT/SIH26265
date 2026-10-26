@@ -1,0 +1,2 @@
+# Keep shell scripts LF so they run on macOS/Linux/WSL even from a Windows checkout.
+*.sh text eol=lf
