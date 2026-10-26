@@ -1,0 +1,14 @@
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.env
+.env.local
+.env.test
+storage/
+coverage/
+playwright-report/
+test-results/
+npm-debug.log*
+.DS_Store
+tests/e2e/.tmp/

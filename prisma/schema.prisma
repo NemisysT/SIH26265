@@ -1,0 +1,625 @@
+// Security Deposit / FDR Management Portal — relational schema.
+//
+// Key decisions (see README "Data model"):
+// - Money is NUMERIC(15,2); never floating point.
+// - Business dates (issue / maturity) are DATE columns interpreted in Asia/Kolkata.
+// - Maturity / expiry are *derived* from maturityDate at query time, never stored as a status,
+//   so an instrument can never silently become "valid" again.
+// - Renewals / replacements create a NEW instrument linked to the original; the original row is
+//   never overwritten.
+// - audit_events is append-only (enforced by a database trigger in the initial migration).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- enums
+
+enum Role {
+  INSTITUTION_USER
+  OFFICER
+  APPROVING_AUTHORITY
+  ADMIN
+  AUDITOR
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  DISABLED
+}
+
+enum InstitutionStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  SUSPENDED
+  REJECTED
+}
+
+enum InstrumentType {
+  FDR
+  SECURITY_DEPOSIT
+}
+
+enum InstrumentOrigin {
+  PORTAL
+  LEGACY_IMPORT
+}
+
+enum InstrumentStatus {
+  DRAFT
+  PENDING_SCRUTINY
+  UNDER_REVIEW
+  CORRECTION_REQUIRED
+  VERIFICATION_PENDING
+  VERIFIED
+  ACCEPTED
+  REJECTED
+  REPLACED
+  RELEASED
+  WITHDRAWN
+}
+
+enum VerificationStatus {
+  NOT_REVIEWED
+  PENDING
+  CONFIRMED
+  DISCREPANCY
+  UNABLE_TO_VERIFY
+  CORRECTION_REQUESTED
+}
+
+enum VerificationMethod {
+  AUTOMATED_CONSISTENCY_CHECK
+  MANUAL_DOCUMENT_REVIEW
+  BANK_CONFIRMATION_LETTER
+  EXTERNAL_PROVIDER
+}
+
+enum VerificationSource {
+  SYSTEM
+  OFFICER_REVIEW
+  BANK_CORRESPONDENCE
+  EXTERNAL_PROVIDER
+}
+
+enum DocumentType {
+  FDR_RECEIPT
+  DEPOSIT_CONFIRMATION
+  RENEWAL_DOCUMENT
+  RELEASE_SUPPORTING
+  BANK_VERIFICATION_LETTER
+  RELEASE_COMPLETION_EVIDENCE
+  OTHER
+}
+
+enum DocumentReviewStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum DiscrepancySeverity {
+  BLOCKING
+  WARNING
+}
+
+enum DiscrepancySource {
+  AUTOMATED
+  OFFICER
+}
+
+enum DiscrepancyStatus {
+  OPEN
+  RESOLVED
+  WAIVED
+}
+
+enum RenewalKind {
+  RENEWAL
+  REPLACEMENT
+}
+
+enum RenewalStatus {
+  IN_PROGRESS
+  APPROVED
+  REJECTED
+  WITHDRAWN
+}
+
+enum ReleaseType {
+  RELEASE
+  REFUND
+}
+
+enum ReleaseStatus {
+  SUBMITTED
+  UNDER_SCRUTINY
+  INFO_REQUESTED
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  COMPLETED
+  WITHDRAWN
+}
+
+enum CommentVisibility {
+  SHARED
+  INTERNAL
+}
+
+enum NotificationType {
+  SUBMISSION_RECEIVED
+  VERIFICATION_PENDING
+  CORRECTION_REQUESTED
+  CORRECTION_SUBMITTED
+  VERIFICATION_RESULT
+  MATURITY_UPCOMING
+  MATURITY_REACHED
+  RENEWAL_SUBMITTED
+  RELEASE_SUBMITTED
+  RELEASE_DECISION
+  OVERDUE_ACTION
+  ESCALATION
+  INSTITUTION_REGISTRATION
+  GENERAL
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+}
+
+enum DeliveryStatus {
+  PENDING
+  DELIVERED
+  SIMULATED
+  FAILED
+  SKIPPED
+}
+
+enum JobStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+// ---------------------------------------------------------------- reference data
+
+model Region {
+  id           String          @id @default(uuid()) @db.Uuid
+  code         String          @unique
+  name         String
+  isActive     Boolean         @default(true)
+  institutions Institution[]
+  officers     OfficerRegion[]
+  createdAt    DateTime        @default(now())
+
+  @@map("regions")
+}
+
+model BankReference {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @unique
+  shortCode   String   @unique
+  isActive    Boolean  @default(true)
+  isFictional Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  @@map("bank_references")
+}
+
+model SystemSetting {
+  key         String   @id
+  value       Json
+  updatedById String?  @db.Uuid
+  updatedAt   DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+model Counter {
+  key   String @id
+  value Int
+
+  @@map("counters")
+}
+
+// ---------------------------------------------------------------- identity
+
+model User {
+  id            String          @id @default(uuid()) @db.Uuid
+  email         String          @unique
+  name          String
+  designation   String?
+  passwordHash  String
+  role          Role
+  status        UserStatus      @default(ACTIVE)
+  institutionId String?         @db.Uuid
+  institution   Institution?    @relation(fields: [institutionId], references: [id])
+  officerRegions OfficerRegion[]
+  failedLogins  Int             @default(0)
+  lockedUntil   DateTime?
+  lastLoginAt   DateTime?
+  isDemo        Boolean         @default(false)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  sessions      Session[]
+  notifications Notification[]
+
+  @@index([role])
+  @@index([institutionId])
+  @@map("users")
+}
+
+model OfficerRegion {
+  userId   String @db.Uuid
+  regionId String @db.Uuid
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  region   Region @relation(fields: [regionId], references: [id])
+
+  @@id([userId, regionId])
+  @@map("officer_regions")
+}
+
+model Session {
+  id         String   @id // SHA-256 of the opaque cookie token; the raw token is never stored
+  userId     String   @db.Uuid
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  lastSeenAt DateTime @default(now())
+  ipAddress  String?
+  userAgent  String?
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// ---------------------------------------------------------------- institutions
+
+model Institution {
+  id                String            @id @default(uuid()) @db.Uuid
+  code              String            @unique
+  approvalReference String?
+  name              String
+  category          String
+  regionId          String            @db.Uuid
+  region            Region            @relation(fields: [regionId], references: [id])
+  addressLine       String
+  city              String
+  state             String
+  pincode           String
+  contactName       String
+  contactEmail      String
+  contactPhone      String
+  status            InstitutionStatus @default(PENDING_APPROVAL)
+  statusReason      String?
+  approvedById      String?           @db.Uuid
+  approvedAt        DateTime?
+  isDemo            Boolean           @default(false)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  users           User[]
+  instruments     Instrument[]
+  documents       Document[]
+  releaseRequests ReleaseRequest[]
+
+  @@index([regionId])
+  @@index([status])
+  @@index([name])
+  @@map("institutions")
+}
+
+// ---------------------------------------------------------------- instruments
+
+model Instrument {
+  id                 String             @id @default(uuid()) @db.Uuid
+  referenceNo        String             @unique
+  institutionId      String             @db.Uuid
+  institution        Institution        @relation(fields: [institutionId], references: [id])
+  type               InstrumentType
+  origin             InstrumentOrigin   @default(PORTAL)
+  // Institution-submitted values. Nullable so drafts and legacy imports can be stored as-is;
+  // submission validation and automated checks enforce completeness.
+  instrumentNumber   String?
+  bankName           String?
+  branchName         String?
+  ifscCode           String?
+  amount             Decimal?           @db.Decimal(15, 2)
+  currency           String             @default("INR")
+  issueDate          DateTime?          @db.Date
+  maturityDate       DateTime?          @db.Date
+  validUntil         DateTime?          @db.Date
+  purpose            String?
+  notes              String?
+
+  status             InstrumentStatus   @default(DRAFT)
+  statusChangedAt    DateTime           @default(now())
+  verificationStatus VerificationStatus @default(NOT_REVIEWED)
+  submittedAt        DateTime?
+  firstSubmittedAt   DateTime?
+  reviewerId         String?            @db.Uuid
+  decidedById        String?            @db.Uuid
+  decidedAt          DateTime?
+  decisionReason     String?
+
+  // Renewal / replacement lineage. Several attempts may point at one original (e.g. a rejected
+  // renewal followed by a new one); the accepted attempt is the one whose case is APPROVED.
+  replacesInstrumentId String?          @db.Uuid
+  replaces             Instrument?      @relation("Replacement", fields: [replacesInstrumentId], references: [id])
+  replacements         Instrument[]     @relation("Replacement")
+
+  version            Int                @default(1)
+  clientRequestId    String?            @unique
+  createdById        String             @db.Uuid
+  isDemo             Boolean            @default(false)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  documents          Document[]
+  verifications      VerificationRecord[]
+  discrepancies      Discrepancy[]
+  comments           Comment[]
+  releaseRequests    ReleaseRequest[]
+  renewalsAsOriginal RenewalCase[]      @relation("RenewalOriginal")
+  renewalAsNew       RenewalCase?       @relation("RenewalNew")
+
+  @@index([institutionId])
+  @@index([status])
+  @@index([maturityDate])
+  @@index([bankName, instrumentNumber])
+  @@index([replacesInstrumentId])
+  @@map("instruments")
+}
+
+model Document {
+  id               String               @id @default(uuid()) @db.Uuid
+  institutionId    String               @db.Uuid
+  institution      Institution          @relation(fields: [institutionId], references: [id])
+  instrumentId     String?              @db.Uuid
+  instrument       Instrument?          @relation(fields: [instrumentId], references: [id])
+  releaseRequestId String?              @db.Uuid
+  releaseRequest   ReleaseRequest?      @relation(fields: [releaseRequestId], references: [id])
+  docType          DocumentType
+  originalName     String
+  storageKey       String               @unique // opaque, server-generated; never exposed to clients
+  sizeBytes        Int
+  mimeType         String               // detected from file signature, not the browser header
+  sha256           String
+  version          Int                  @default(1)
+  isCurrent        Boolean              @default(true)
+  supersedesId     String?              @db.Uuid
+  uploadedById     String               @db.Uuid
+  uploadedAt       DateTime             @default(now())
+  reviewStatus     DocumentReviewStatus @default(PENDING)
+  reviewNote       String?
+  reviewedById     String?              @db.Uuid
+  reviewedAt       DateTime?
+
+  @@index([instrumentId])
+  @@index([releaseRequestId])
+  @@index([institutionId])
+  @@map("documents")
+}
+
+model VerificationRecord {
+  id                     String             @id @default(uuid()) @db.Uuid
+  instrumentId           String             @db.Uuid
+  instrument             Instrument         @relation(fields: [instrumentId], references: [id])
+  method                 VerificationMethod
+  source                 VerificationSource
+  providerName           String?
+  isSimulated            Boolean            @default(false)
+  independentlyConfirmed Boolean            @default(false)
+  initiatedById          String?            @db.Uuid
+  initiatedBy            String             // human-readable actor label, e.g. "system:consistency-checks"
+  attemptedAt            DateTime           @default(now())
+  result                 VerificationStatus
+  evidenceReference      String?
+  evidenceDocumentId     String?            @db.Uuid
+  discrepancyDetails     String?
+  observations           String?
+
+  @@index([instrumentId])
+  @@map("verification_records")
+}
+
+model Discrepancy {
+  id               String              @id @default(uuid()) @db.Uuid
+  instrumentId     String?             @db.Uuid
+  instrument       Instrument?         @relation(fields: [instrumentId], references: [id])
+  releaseRequestId String?             @db.Uuid
+  releaseRequest   ReleaseRequest?     @relation(fields: [releaseRequestId], references: [id])
+  code             String
+  field            String?
+  severity         DiscrepancySeverity
+  source           DiscrepancySource
+  status           DiscrepancyStatus   @default(OPEN)
+  message          String
+  raisedById       String?             @db.Uuid
+  raisedAt         DateTime            @default(now())
+  resolvedById     String?             @db.Uuid
+  resolvedAt       DateTime?
+  resolutionNote   String?
+
+  @@index([instrumentId, status])
+  @@index([releaseRequestId, status])
+  @@map("discrepancies")
+}
+
+model Comment {
+  id               String            @id @default(uuid()) @db.Uuid
+  instrumentId     String?           @db.Uuid
+  instrument       Instrument?       @relation(fields: [instrumentId], references: [id])
+  releaseRequestId String?           @db.Uuid
+  releaseRequest   ReleaseRequest?   @relation(fields: [releaseRequestId], references: [id])
+  authorId         String            @db.Uuid
+  authorLabel      String
+  visibility       CommentVisibility @default(SHARED)
+  body             String
+  createdAt        DateTime          @default(now())
+
+  @@index([instrumentId])
+  @@index([releaseRequestId])
+  @@map("comments")
+}
+
+model RenewalCase {
+  id                   String        @id @default(uuid()) @db.Uuid
+  referenceNo          String        @unique
+  kind                 RenewalKind
+  originalInstrumentId String        @db.Uuid
+  originalInstrument   Instrument    @relation("RenewalOriginal", fields: [originalInstrumentId], references: [id])
+  newInstrumentId      String        @unique @db.Uuid
+  newInstrument        Instrument    @relation("RenewalNew", fields: [newInstrumentId], references: [id])
+  reason               String
+  previousMaturityDate DateTime?     @db.Date
+  proposedMaturityDate DateTime?     @db.Date
+  status               RenewalStatus @default(IN_PROGRESS)
+  submittedById        String        @db.Uuid
+  submittedAt          DateTime      @default(now())
+  decidedAt            DateTime?
+  decisionNote         String?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  @@index([originalInstrumentId])
+  @@index([status])
+  @@map("renewal_cases")
+}
+
+model ReleaseRequest {
+  id                  String        @id @default(uuid()) @db.Uuid
+  referenceNo         String        @unique
+  institutionId       String        @db.Uuid
+  institution         Institution   @relation(fields: [institutionId], references: [id])
+  instrumentId        String        @db.Uuid
+  instrument          Instrument    @relation(fields: [instrumentId], references: [id])
+  type                ReleaseType
+  requestedAmount     Decimal       @db.Decimal(15, 2)
+  reason              String
+  status              ReleaseStatus @default(SUBMITTED)
+  statusChangedAt     DateTime      @default(now())
+  submittedById       String        @db.Uuid
+  submittedAt         DateTime      @default(now())
+  assignedOfficerId   String?       @db.Uuid
+  scrutinyNote        String?
+  scrutinizedById     String?       @db.Uuid
+  scrutinizedAt       DateTime?
+  infoRequestNote     String?
+  decision            String?       // APPROVED | REJECTED — retained permanently once recorded
+  decisionReason      String?
+  decidedById         String?       @db.Uuid
+  decidedAt           DateTime?
+  completionReference String?
+  completionNote      String?
+  completedById       String?       @db.Uuid
+  completedAt         DateTime?
+  version             Int           @default(1)
+  clientRequestId     String?       @unique
+  isDemo              Boolean       @default(false)
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+
+  documents     Document[]
+  discrepancies Discrepancy[]
+  comments      Comment[]
+
+  @@index([institutionId])
+  @@index([instrumentId])
+  @@index([status])
+  @@map("release_requests")
+}
+
+// ---------------------------------------------------------------- notifications
+
+model Notification {
+  id               String                 @id @default(uuid()) @db.Uuid
+  recipientId      String                 @db.Uuid
+  recipient        User                   @relation(fields: [recipientId], references: [id], onDelete: Cascade)
+  type             NotificationType
+  title            String
+  message          String
+  link             String?
+  institutionId    String?                @db.Uuid
+  instrumentId     String?                @db.Uuid
+  releaseRequestId String?                @db.Uuid
+  dueDate          DateTime?              @db.Date
+  dedupeKey        String?                @unique
+  readAt           DateTime?
+  createdAt        DateTime               @default(now())
+  deliveries       NotificationDelivery[]
+
+  @@index([recipientId, readAt])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+model NotificationDelivery {
+  id             String              @id @default(uuid()) @db.Uuid
+  notificationId String              @db.Uuid
+  notification   Notification        @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  channel        NotificationChannel
+  status         DeliveryStatus      @default(PENDING)
+  isSimulated    Boolean             @default(false)
+  attempts       Int                 @default(0)
+  lastError      String?
+  nextAttemptAt  DateTime?
+  deliveredAt    DateTime?
+  providerRef    String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  @@unique([notificationId, channel])
+  @@index([status, nextAttemptAt])
+  @@map("notification_deliveries")
+}
+
+// ---------------------------------------------------------------- audit & operations
+
+model AuditEvent {
+  id            BigInt   @id @default(autoincrement())
+  actorId       String?  @db.Uuid
+  actorRole     String?
+  actorLabel    String
+  action        String
+  resourceType  String
+  resourceId    String
+  institutionId String?  @db.Uuid
+  before        Json?
+  after         Json?
+  reason        String?
+  correlationId String?
+  ipAddress     String?
+  createdAt     DateTime @default(now())
+
+  @@index([resourceType, resourceId])
+  @@index([actorId])
+  @@index([institutionId])
+  @@index([createdAt])
+  @@index([action])
+  @@map("audit_events")
+}
+
+model JobRun {
+  id            String    @id @default(uuid()) @db.Uuid
+  job           String
+  trigger       String
+  triggeredById String?   @db.Uuid
+  status        JobStatus @default(RUNNING)
+  startedAt     DateTime  @default(now())
+  finishedAt    DateTime?
+  summary       Json?
+  error         String?
+
+  @@index([job, startedAt])
+  @@map("job_runs")
+}
