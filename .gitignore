@@ -5,7 +5,7 @@ out/
 .env
 .env.local
 .env.test
-storage/
+/storage/
 coverage/
 playwright-report/
 test-results/
