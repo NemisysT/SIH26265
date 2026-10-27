@@ -1,6 +1,7 @@
 // Maturity / escalation monitor entry point for cron jobs and local development.
 //   npm run monitor          # single pass (use from cron / Render cron job)
 //   npm run monitor:watch    # loop every MONITOR_INTERVAL_MINUTES (default 60) for local dev
+import "./load-env";
 import { prisma } from "@/server/db";
 import { runMonitor } from "@/server/jobs/monitor";
 

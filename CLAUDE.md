@@ -3,10 +3,11 @@
 Security Deposit / FDR portal prototype (SIH PS 26265). Next.js 15 App Router + Prisma 6 + PostgreSQL.
 
 ## Commands
+- `./run.sh` / `.\run.ps1` — one-command local start (thin wrappers around `scripts/launcher.mjs`); `check|test|e2e|monitor|reset-demo` subcommands
 - `npm run dev` · `npm run build` · `npm run lint` (zero warnings) · `npm run typecheck`
 - `npm run test` — Vitest unit + integration against `TEST_DATABASE_URL` (default `sdp_test`; wiped)
 - `npm run test:e2e` — Playwright; reseeds the `.env` database
-- `npx prisma migrate dev --name <x>` · `npm run db:seed` (wipes data) · `npm run monitor`
+- `npx prisma migrate dev --name <x>` · `npm run db:seed` (wipes data; `-- --if-empty` never deletes) · `npm run monitor`
 
 ## Architecture rules
 - All domain reads/writes go through `src/server/services/*`. Each service takes an `Actor`, calls
@@ -21,6 +22,8 @@ Security Deposit / FDR portal prototype (SIH PS 26265). Next.js 15 App Router + 
 - Never return `storageKey` to clients (queries use `omit: { storageKey: true }`).
 
 ## Invariants (do not weaken)
+- The launcher's normal start must stay non-destructive: `migrate deploy` only, seed only via `--if-empty`,
+  never `migrate reset`, never `docker compose down -v`, never kill processes it did not start.
 - Submission ≠ approval; document upload ≠ verification; simulated provider results never confirm.
 - Automated BLOCKING discrepancies close only via a correction that removes the condition.
 - Matured/expired is derived from `maturityDate`; never stored as a status.
